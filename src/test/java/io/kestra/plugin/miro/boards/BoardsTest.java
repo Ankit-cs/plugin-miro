@@ -503,6 +503,62 @@ class BoardsTest {
         assertThat(result.isPresent(), is(false));
     }
 
+    @Test
+    void trigger_consecutivePolls_detectsNewBoardsOnSecondPoll() throws Exception {
+        var now = ZonedDateTime.now(java.time.ZoneOffset.UTC);
+        var trigger = Trigger.builder()
+            .id("test-trigger-consecutive-" + System.nanoTime())
+            .type(Trigger.class.getName())
+            .token(Property.ofValue("test-token"))
+            .interval(Duration.ofMinutes(5))
+            .baseUrl(baseUrl)
+            .build();
+
+        var context = TestsUtils.mockTrigger(runContextFactory, trigger);
+        var triggerContext = io.kestra.core.models.triggers.Trigger.builder()
+            .triggerId(trigger.getId())
+            .flowId(context.getValue().getFlowId())
+            .namespace(context.getValue().getNamespace())
+            .date(now.minus(Duration.ofMinutes(10))) // Initial deploy date in the past
+            .build();
+
+        // 1st poll: returns a board created 1 minute ago
+        var firstPollBody = Map.of(
+            "data", java.util.List.of(
+                boardJsonWithCreatedAt("board-1", "First Board", now.minus(Duration.ofMinutes(1)).toInstant().toString())
+            ),
+            "total", 1,
+            "size", 1
+        );
+        wireMock.stubFor(get(urlPathEqualTo("/boards"))
+            .willReturn(aResponse()
+                .withHeader("Content-Type", "application/json")
+                .withBody(MAPPER.writeValueAsString(firstPollBody))
+                .withStatus(200)));
+
+        Optional<Execution> firstResult = trigger.evaluate(context.getKey(), triggerContext);
+        assertThat(firstResult.isPresent(), is(true));
+        assertThat(firstResult.get().getTrigger().getVariables().get("id"), Matchers.equalTo("board-1"));
+
+        // 2nd poll: new board created later, still evaluated with the triggerContext from deploy
+        var secondPollBody = Map.of(
+            "data", java.util.List.of(
+                boardJsonWithCreatedAt("board-2", "Second Board", now.toInstant().toString())
+            ),
+            "total", 1,
+            "size", 1
+        );
+        wireMock.stubFor(get(urlPathEqualTo("/boards"))
+            .willReturn(aResponse()
+                .withHeader("Content-Type", "application/json")
+                .withBody(MAPPER.writeValueAsString(secondPollBody))
+                .withStatus(200)));
+
+        Optional<Execution> secondResult = trigger.evaluate(context.getKey(), triggerContext);
+        assertThat(secondResult.isPresent(), is(true));
+        assertThat(secondResult.get().getTrigger().getVariables().get("id"), Matchers.equalTo("board-2"));
+    }
+
     // --- Integration tests (require a real Miro token) ---
 
     @Test

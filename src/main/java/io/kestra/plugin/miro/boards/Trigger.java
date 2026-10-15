@@ -124,15 +124,9 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
         var logger = runContext.logger();
 
         // Fire for boards created in the window (pollDate - interval, pollDate].
-        // context.getDate() is THIS poll's scheduled slot, and the scheduler spaces
-        // polls exactly `interval` apart, so consecutive windows tile without gaps or
-        // overlaps. The upper bound matters: the worker runs a few seconds after the
-        // slot, so without it a board created in that gap would match two consecutive
-        // windows and fire twice. Using getDate() as the lower bound (no subtraction)
-        // would ask for boards created after "now" and never fire at all.
-        var pollDate = context.getDate() != null
-            ? context.getDate().withZoneSameInstant(ZoneOffset.UTC)
-            : ZonedDateTime.now(ZoneOffset.UTC);
+        // Evaluate against current UTC time so every scheduled poll inspects its active
+        // interval window, rather than freezing on context.getDate() from initial deploy.
+        var pollDate = ZonedDateTime.now(ZoneOffset.UTC);
         var since = pollDate.minus(interval);
 
         var rLimit = runContext.render(limit).as(Integer.class).orElse(20);

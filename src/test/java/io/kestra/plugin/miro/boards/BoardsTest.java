@@ -635,6 +635,167 @@ class BoardsTest {
         assertThat(delayedRes.get().getTrigger().getVariables().get("count"), Matchers.equalTo(1));
     }
 
+    @Test
+    void trigger_sameTimestamp_tieBreakDeliversBothWithoutDuplicates() throws Exception {
+        var now = ZonedDateTime.now(java.time.ZoneOffset.UTC);
+        var sharedTimestamp = now.toInstant().toString();
+
+        var trigger = Trigger.builder()
+            .id("test-trigger-tie-" + System.nanoTime())
+            .type(Trigger.class.getName())
+            .token(Property.ofValue("test-token"))
+            .teamId(Property.ofValue("team-123"))
+            .interval(Duration.ofMinutes(5))
+            .baseUrl(baseUrl)
+            .build();
+
+        var context = TestsUtils.mockTrigger(runContextFactory, trigger);
+        var triggerContext1 = io.kestra.core.models.triggers.Trigger.builder()
+            .triggerId(trigger.getId())
+            .flowId(context.getValue().getFlowId())
+            .namespace(context.getValue().getNamespace())
+            .date(now)
+            .build();
+
+        // 1st poll: board-A created at sharedTimestamp
+        wireMock.stubFor(get(urlPathEqualTo("/boards"))
+            .willReturn(aResponse()
+                .withHeader("Content-Type", "application/json")
+                .withBody(MAPPER.writeValueAsString(Map.of(
+                    "data", java.util.List.of(
+                        boardJsonWithCreatedAt("board-A", "Board A", sharedTimestamp)
+                    ),
+                    "total", 1,
+                    "size", 1
+                )))
+                .withStatus(200)));
+
+        var res1 = trigger.evaluate(context.getKey(), triggerContext1);
+        assertThat(res1.isPresent(), is(true));
+        assertThat(res1.get().getTrigger().getVariables().get("id"), Matchers.equalTo("board-A"));
+
+        // 2nd poll: board-B also created at sharedTimestamp, returned together with board-A
+        var triggerContext2 = io.kestra.core.models.triggers.Trigger.builder()
+            .triggerId(trigger.getId())
+            .flowId(context.getValue().getFlowId())
+            .namespace(context.getValue().getNamespace())
+            .date(now.plus(Duration.ofMinutes(5)))
+            .build();
+
+        wireMock.stubFor(get(urlPathEqualTo("/boards"))
+            .willReturn(aResponse()
+                .withHeader("Content-Type", "application/json")
+                .withBody(MAPPER.writeValueAsString(Map.of(
+                    "data", java.util.List.of(
+                        boardJsonWithCreatedAt("board-B", "Board B", sharedTimestamp),
+                        boardJsonWithCreatedAt("board-A", "Board A", sharedTimestamp)
+                    ),
+                    "total", 2,
+                    "size", 2
+                )))
+                .withStatus(200)));
+
+        var res2 = trigger.evaluate(context.getKey(), triggerContext2);
+        assertThat(res2.isPresent(), is(true));
+        // board-B is delivered, board-A is not duplicated
+        assertThat(res2.get().getTrigger().getVariables().get("id"), Matchers.equalTo("board-B"));
+        assertThat(res2.get().getTrigger().getVariables().get("count"), Matchers.equalTo(1));
+
+        // 3rd poll: both board-A and board-B are already seen at sharedTimestamp -> no execution
+        var triggerContext3 = io.kestra.core.models.triggers.Trigger.builder()
+            .triggerId(trigger.getId())
+            .flowId(context.getValue().getFlowId())
+            .namespace(context.getValue().getNamespace())
+            .date(now.plus(Duration.ofMinutes(10)))
+            .build();
+
+        var res3 = trigger.evaluate(context.getKey(), triggerContext3);
+        assertThat(res3.isPresent(), is(false));
+    }
+
+    @Test
+    void trigger_pagination_fetchesMultiplePagesUntilWatermark() throws Exception {
+        var now = ZonedDateTime.now(java.time.ZoneOffset.UTC);
+
+        var trigger = Trigger.builder()
+            .id("test-trigger-paging-" + System.nanoTime())
+            .type(Trigger.class.getName())
+            .token(Property.ofValue("test-token"))
+            .teamId(Property.ofValue("team-123"))
+            .interval(Duration.ofMinutes(5))
+            .limit(Property.ofValue(2)) // Page size 2
+            .baseUrl(baseUrl)
+            .build();
+
+        var context = TestsUtils.mockTrigger(runContextFactory, trigger);
+        var initialContext = io.kestra.core.models.triggers.Trigger.builder()
+            .triggerId(trigger.getId())
+            .flowId(context.getValue().getFlowId())
+            .namespace(context.getValue().getNamespace())
+            .date(now)
+            .build();
+
+        // Seed watermark with board-0
+        wireMock.stubFor(get(urlPathEqualTo("/boards"))
+            .withQueryParam("offset", equalTo("0"))
+            .willReturn(aResponse()
+                .withHeader("Content-Type", "application/json")
+                .withBody(MAPPER.writeValueAsString(Map.of(
+                    "data", java.util.List.of(
+                        boardJsonWithCreatedAt("board-0", "Board 0", now.minus(Duration.ofMinutes(1)).toInstant().toString())
+                    ),
+                    "total", 1,
+                    "size", 1
+                )))
+                .withStatus(200)));
+
+        var seedRes = trigger.evaluate(context.getKey(), initialContext);
+        assertThat(seedRes.isPresent(), is(true));
+
+        // Next cycle: 3 new boards across 2 pages
+        var pollContext = io.kestra.core.models.triggers.Trigger.builder()
+            .triggerId(trigger.getId())
+            .flowId(context.getValue().getFlowId())
+            .namespace(context.getValue().getNamespace())
+            .date(now.plus(Duration.ofMinutes(5)))
+            .build();
+
+        // Page 1 (offset=0): board-3, board-2
+        wireMock.stubFor(get(urlPathEqualTo("/boards"))
+            .withQueryParam("offset", equalTo("0"))
+            .willReturn(aResponse()
+                .withHeader("Content-Type", "application/json")
+                .withBody(MAPPER.writeValueAsString(Map.of(
+                    "data", java.util.List.of(
+                        boardJsonWithCreatedAt("board-3", "Board 3", now.plus(Duration.ofMinutes(3)).toInstant().toString()),
+                        boardJsonWithCreatedAt("board-2", "Board 2", now.plus(Duration.ofMinutes(2)).toInstant().toString())
+                    ),
+                    "total", 4,
+                    "size", 2
+                )))
+                .withStatus(200)));
+
+        // Page 2 (offset=2): board-1, and older board-0
+        wireMock.stubFor(get(urlPathEqualTo("/boards"))
+            .withQueryParam("offset", equalTo("2"))
+            .willReturn(aResponse()
+                .withHeader("Content-Type", "application/json")
+                .withBody(MAPPER.writeValueAsString(Map.of(
+                    "data", java.util.List.of(
+                        boardJsonWithCreatedAt("board-1", "Board 1", now.plus(Duration.ofMinutes(1)).toInstant().toString()),
+                        boardJsonWithCreatedAt("board-0", "Board 0", now.minus(Duration.ofMinutes(1)).toInstant().toString())
+                    ),
+                    "total", 4,
+                    "size", 2
+                )))
+                .withStatus(200)));
+
+        var pollRes = trigger.evaluate(context.getKey(), pollContext);
+        assertThat(pollRes.isPresent(), is(true));
+        // All 3 new boards collected across pages, board-0 excluded
+        assertThat(pollRes.get().getTrigger().getVariables().get("count"), Matchers.equalTo(3));
+    }
+
     // --- Integration tests (require a real Miro token) ---
 
     @Test

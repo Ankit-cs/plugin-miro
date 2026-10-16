@@ -515,14 +515,15 @@ class BoardsTest {
             .build();
 
         var context = TestsUtils.mockTrigger(runContextFactory, trigger);
-        var triggerContext = io.kestra.core.models.triggers.Trigger.builder()
+        // 1st poll at slot 'now'
+        var triggerContext1 = io.kestra.core.models.triggers.Trigger.builder()
             .triggerId(trigger.getId())
             .flowId(context.getValue().getFlowId())
             .namespace(context.getValue().getNamespace())
-            .date(now.minus(Duration.ofMinutes(10))) // Initial deploy date in the past
+            .date(now)
             .build();
 
-        // 1st poll: returns a board created 1 minute ago
+        // 1st poll returns board-1
         var firstPollBody = Map.of(
             "data", java.util.List.of(
                 boardJsonWithCreatedAt("board-1", "First Board", now.minus(Duration.ofMinutes(1)).toInstant().toString())
@@ -536,17 +537,26 @@ class BoardsTest {
                 .withBody(MAPPER.writeValueAsString(firstPollBody))
                 .withStatus(200)));
 
-        Optional<Execution> firstResult = trigger.evaluate(context.getKey(), triggerContext);
+        Optional<Execution> firstResult = trigger.evaluate(context.getKey(), triggerContext1);
         assertThat(firstResult.isPresent(), is(true));
         assertThat(firstResult.get().getTrigger().getVariables().get("id"), Matchers.equalTo("board-1"));
 
-        // 2nd poll: new board created later, still evaluated with the triggerContext from deploy
+        // 2nd poll: scheduled slot advances realistically by interval (now + 5 minutes)
+        var triggerContext2 = io.kestra.core.models.triggers.Trigger.builder()
+            .triggerId(trigger.getId())
+            .flowId(context.getValue().getFlowId())
+            .namespace(context.getValue().getNamespace())
+            .date(now.plus(Duration.ofMinutes(5)))
+            .build();
+
+        // Miro API returns both board-2 and already-seen board-1
         var secondPollBody = Map.of(
             "data", java.util.List.of(
-                boardJsonWithCreatedAt("board-2", "Second Board", now.toInstant().toString())
+                boardJsonWithCreatedAt("board-2", "Second Board", now.plus(Duration.ofMinutes(2)).toInstant().toString()),
+                boardJsonWithCreatedAt("board-1", "First Board", now.minus(Duration.ofMinutes(1)).toInstant().toString())
             ),
-            "total", 1,
-            "size", 1
+            "total", 2,
+            "size", 2
         );
         wireMock.stubFor(get(urlPathEqualTo("/boards"))
             .willReturn(aResponse()
@@ -554,9 +564,75 @@ class BoardsTest {
                 .withBody(MAPPER.writeValueAsString(secondPollBody))
                 .withStatus(200)));
 
-        Optional<Execution> secondResult = trigger.evaluate(context.getKey(), triggerContext);
+        Optional<Execution> secondResult = trigger.evaluate(context.getKey(), triggerContext2);
         assertThat(secondResult.isPresent(), is(true));
         assertThat(secondResult.get().getTrigger().getVariables().get("id"), Matchers.equalTo("board-2"));
+        // Assert board-1 is not delivered twice
+        assertThat(secondResult.get().getTrigger().getVariables().get("count"), Matchers.equalTo(1));
+    }
+
+    @Test
+    void trigger_afterDelayedPollOrRestart_resumesFromWatermark() throws Exception {
+        var now = ZonedDateTime.now(java.time.ZoneOffset.UTC);
+        var trigger = Trigger.builder()
+            .id("test-trigger-delayed-" + System.nanoTime())
+            .type(Trigger.class.getName())
+            .token(Property.ofValue("test-token"))
+            .interval(Duration.ofMinutes(5))
+            .baseUrl(baseUrl)
+            .build();
+
+        var context = TestsUtils.mockTrigger(runContextFactory, trigger);
+        var initialContext = io.kestra.core.models.triggers.Trigger.builder()
+            .triggerId(trigger.getId())
+            .flowId(context.getValue().getFlowId())
+            .namespace(context.getValue().getNamespace())
+            .date(now)
+            .build();
+
+        // 1st poll seeds watermark with board-1
+        var firstBody = Map.of(
+            "data", java.util.List.of(
+                boardJsonWithCreatedAt("board-1", "First Board", now.minus(Duration.ofMinutes(1)).toInstant().toString())
+            ),
+            "total", 1,
+            "size", 1
+        );
+        wireMock.stubFor(get(urlPathEqualTo("/boards"))
+            .willReturn(aResponse()
+                .withHeader("Content-Type", "application/json")
+                .withBody(MAPPER.writeValueAsString(firstBody))
+                .withStatus(200)));
+
+        var firstRes = trigger.evaluate(context.getKey(), initialContext);
+        assertThat(firstRes.isPresent(), is(true));
+
+        // Delayed poll (e.g. restart after 30 minutes downtime)
+        var delayedContext = io.kestra.core.models.triggers.Trigger.builder()
+            .triggerId(trigger.getId())
+            .flowId(context.getValue().getFlowId())
+            .namespace(context.getValue().getNamespace())
+            .date(now.plus(Duration.ofMinutes(30)))
+            .build();
+
+        var delayedBody = Map.of(
+            "data", java.util.List.of(
+                boardJsonWithCreatedAt("board-3", "Third Board", now.plus(Duration.ofMinutes(10)).toInstant().toString()),
+                boardJsonWithCreatedAt("board-1", "First Board", now.minus(Duration.ofMinutes(1)).toInstant().toString())
+            ),
+            "total", 2,
+            "size", 2
+        );
+        wireMock.stubFor(get(urlPathEqualTo("/boards"))
+            .willReturn(aResponse()
+                .withHeader("Content-Type", "application/json")
+                .withBody(MAPPER.writeValueAsString(delayedBody))
+                .withStatus(200)));
+
+        var delayedRes = trigger.evaluate(context.getKey(), delayedContext);
+        assertThat(delayedRes.isPresent(), is(true));
+        assertThat(delayedRes.get().getTrigger().getVariables().get("id"), Matchers.equalTo("board-3"));
+        assertThat(delayedRes.get().getTrigger().getVariables().get("count"), Matchers.equalTo(1));
     }
 
     // --- Integration tests (require a real Miro token) ---

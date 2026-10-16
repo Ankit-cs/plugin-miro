@@ -37,7 +37,6 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 
 @SuperBuilder
 @ToString
@@ -48,9 +47,10 @@ import java.util.Set;
     title = "Trigger a flow when new Miro boards are created",
     description = """
         Polls the Miro boards list and fires an execution when new boards are created.
-        A watermark tracking the latest board creation timestamp and processed board IDs is persisted in the namespace KV store, ensuring no boards are missed during downtime, restarts, or scheduler delays.
+        A watermark tracking the latest board creation timestamp and processed board IDs is persisted in the namespace KV store under key `<flowId.length>_<flowId>_<triggerId.length>_<triggerId>_watermark`, ensuring no boards are missed during downtime, restarts, or scheduler delays.
         On the initial poll, boards created within the last configured interval are evaluated and the watermark is seeded.
-        Paging retrieves up to 10 pages per poll. When neither `teamId` nor `projectId` is provided, Miro does not support sorting by creation date, so all pages are inspected."""
+        Paging retrieves up to 10 pages per poll (offset pagination). If the 10-page cap is exceeded due to a large backlog, the poll fails to avoid data loss; to unblock and resume polling from the current time, delete the watermark key in the namespace KV store.
+        Note: Miro only sorts by creation date when `teamId` or `projectId` is specified; when neither is provided, all pages (up to 10) are inspected."""
 )
 @Plugin(
     examples = {
@@ -241,7 +241,8 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
                 }
             }
 
-            if ((isSorted && reachedOlder) || boards.size() < rLimit) {
+            var total = listOutput.getTotal();
+            if ((isSorted && reachedOlder) || boards.size() < rLimit || (total != null && currentOffset + boards.size() >= total)) {
                 hasMore = false;
             } else {
                 currentOffset += rLimit;
@@ -253,7 +254,8 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
 
         if (hitPageCap) {
             logger.warn("Reached maximum page limit ({}) during Miro board polling; some boards may remain unread", maxPages);
-            throw new IllegalStateException("Exceeded maximum page limit (" + maxPages + ") during Miro board polling. Increase limit or narrow query with teamId/projectId to prevent data loss.");
+            throw new IllegalStateException("Exceeded maximum page limit (" + maxPages + ") during Miro board polling. "
+                + "To unblock and resume polling from the current time, delete the KV watermark key '" + stateKey + "' in the namespace KV store.");
         }
 
         var newestCreatedAt = sinceInstant;

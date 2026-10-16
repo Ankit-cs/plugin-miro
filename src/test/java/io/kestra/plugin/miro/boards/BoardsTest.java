@@ -8,6 +8,7 @@ import io.kestra.core.models.executions.Execution;
 import io.kestra.core.models.property.Property;
 import io.kestra.core.runners.RunContextFactory;
 import io.kestra.core.serializers.JacksonMapper;
+import io.kestra.core.storages.kv.KVValueAndMetadata;
 import io.kestra.core.utils.TestsUtils;
 import jakarta.inject.Inject;
 import org.hamcrest.Matchers;
@@ -794,6 +795,151 @@ class BoardsTest {
         assertThat(pollRes.isPresent(), is(true));
         // All 3 new boards collected across pages, board-0 excluded
         assertThat(pollRes.get().getTrigger().getVariables().get("count"), Matchers.equalTo(3));
+    }
+
+    @Test
+    void trigger_pageCapExceeded_throwsExceptionAndDoesNotAdvanceWatermark() throws Exception {
+        var now = ZonedDateTime.now(java.time.ZoneOffset.UTC);
+
+        var trigger = Trigger.builder()
+            .id("test-trigger-cap-" + System.nanoTime())
+            .type(Trigger.class.getName())
+            .token(Property.ofValue("test-token"))
+            .teamId(Property.ofValue("team-123"))
+            .interval(Duration.ofMinutes(5))
+            .limit(Property.ofValue(2))
+            .baseUrl(baseUrl)
+            .build();
+
+        var context = TestsUtils.mockTrigger(runContextFactory, trigger);
+        var initialContext = io.kestra.core.models.triggers.Trigger.builder()
+            .triggerId(trigger.getId())
+            .flowId(context.getValue().getFlowId())
+            .namespace(context.getValue().getNamespace())
+            .date(now)
+            .build();
+
+        // Stub 10 pages of 2 boards each, all newer than the watermark, total = 30
+        for (int i = 0; i < 10; i++) {
+            int offset = i * 2;
+            wireMock.stubFor(get(urlPathEqualTo("/boards"))
+                .withQueryParam("offset", equalTo(String.valueOf(offset)))
+                .willReturn(aResponse()
+                    .withHeader("Content-Type", "application/json")
+                    .withBody(MAPPER.writeValueAsString(Map.of(
+                        "data", java.util.List.of(
+                            boardJsonWithCreatedAt("b-" + offset, "Board " + offset, now.plusSeconds(offset + 1).toInstant().toString()),
+                            boardJsonWithCreatedAt("b-" + (offset + 1), "Board " + (offset + 1), now.plusSeconds(offset + 2).toInstant().toString())
+                        ),
+                        "total", 30,
+                        "size", 2
+                    )))
+                    .withStatus(200)));
+        }
+
+        var ex = assertThrows(IllegalStateException.class, () -> trigger.evaluate(context.getKey(), initialContext));
+        assertThat(ex.getMessage(), containsString("Exceeded maximum page limit"));
+        assertThat(ex.getMessage(), containsString("delete the KV watermark key"));
+
+        // Verify watermark was not written to KV store
+        var flowId = context.getValue().getFlowId();
+        var triggerId = trigger.getId();
+        var stateKey = flowId.length() + "_" + flowId + "_" + triggerId.length() + "_" + triggerId + "_watermark";
+        var namespace = context.getValue().getNamespace();
+        var kvStore = context.getKey().getRunContext().namespaceKv(namespace);
+        assertThat(kvStore.getValue(stateKey).isEmpty(), is(true));
+    }
+
+    @Test
+    void trigger_corruptedWatermark_throwsException() throws Exception {
+        var now = ZonedDateTime.now(java.time.ZoneOffset.UTC);
+
+        var trigger = Trigger.builder()
+            .id("test-trigger-corrupt-" + System.nanoTime())
+            .type(Trigger.class.getName())
+            .token(Property.ofValue("test-token"))
+            .teamId(Property.ofValue("team-123"))
+            .baseUrl(baseUrl)
+            .build();
+
+        var context = TestsUtils.mockTrigger(runContextFactory, trigger);
+        var triggerContext = io.kestra.core.models.triggers.Trigger.builder()
+            .triggerId(trigger.getId())
+            .flowId(context.getValue().getFlowId())
+            .namespace(context.getValue().getNamespace())
+            .date(now)
+            .build();
+
+        // Write corrupt watermark state (missing lastCreatedAt) into KV store
+        var flowId = context.getValue().getFlowId();
+        var triggerId = trigger.getId();
+        var stateKey = flowId.length() + "_" + flowId + "_" + triggerId.length() + "_" + triggerId + "_watermark";
+        var namespace = context.getValue().getNamespace();
+        var kvStore = context.getKey().getRunContext().namespaceKv(namespace);
+        kvStore.put(stateKey, new KVValueAndMetadata(
+            null,
+            MAPPER.writeValueAsString(Map.of("seenIds", java.util.List.of("b-1")))
+        ));
+
+        var ex = assertThrows(IllegalStateException.class, () -> trigger.evaluate(context.getKey(), triggerContext));
+        assertThat(ex.getMessage(), containsString("Failed to deserialize or validate watermark"));
+    }
+
+    @Test
+    void trigger_withoutTeamOrProjectId_scansAllPagesAndDeliversNewBoardOnLastPage() throws Exception {
+        var now = ZonedDateTime.now(java.time.ZoneOffset.UTC);
+
+        var trigger = Trigger.builder()
+            .id("test-trigger-no-team-" + System.nanoTime())
+            .type(Trigger.class.getName())
+            .token(Property.ofValue("test-token"))
+            .interval(Duration.ofMinutes(5))
+            .limit(Property.ofValue(2))
+            .baseUrl(baseUrl)
+            .build();
+
+        var context = TestsUtils.mockTrigger(runContextFactory, trigger);
+        var triggerContext = io.kestra.core.models.triggers.Trigger.builder()
+            .triggerId(trigger.getId())
+            .flowId(context.getValue().getFlowId())
+            .namespace(context.getValue().getNamespace())
+            .date(now)
+            .build();
+
+        // Without teamId, results are not sorted by creation date.
+        // Page 1 (offset 0) has old boards (older than interval):
+        wireMock.stubFor(get(urlPathEqualTo("/boards"))
+            .withQueryParam("offset", equalTo("0"))
+            .willReturn(aResponse()
+                .withHeader("Content-Type", "application/json")
+                .withBody(MAPPER.writeValueAsString(Map.of(
+                    "data", java.util.List.of(
+                        boardJsonWithCreatedAt("old-1", "Old 1", now.minus(Duration.ofHours(2)).toInstant().toString()),
+                        boardJsonWithCreatedAt("old-2", "Old 2", now.minus(Duration.ofHours(1)).toInstant().toString())
+                    ),
+                    "total", 3,
+                    "size", 2
+                )))
+                .withStatus(200)));
+
+        // Page 2 (offset 2) has a brand new board created within the interval:
+        wireMock.stubFor(get(urlPathEqualTo("/boards"))
+            .withQueryParam("offset", equalTo("2"))
+            .willReturn(aResponse()
+                .withHeader("Content-Type", "application/json")
+                .withBody(MAPPER.writeValueAsString(Map.of(
+                    "data", java.util.List.of(
+                        boardJsonWithCreatedAt("new-1", "New 1", now.minus(Duration.ofMinutes(1)).toInstant().toString())
+                    ),
+                    "total", 3,
+                    "size", 1
+                )))
+                .withStatus(200)));
+
+        var res = trigger.evaluate(context.getKey(), triggerContext);
+        assertThat(res.isPresent(), is(true));
+        assertThat(res.get().getTrigger().getVariables().get("id"), Matchers.equalTo("new-1"));
+        assertThat(res.get().getTrigger().getVariables().get("count"), Matchers.equalTo(1));
     }
 
     // --- Integration tests (require a real Miro token) ---

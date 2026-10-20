@@ -447,6 +447,7 @@ class BoardsTest {
             .id("test-trigger-" + System.nanoTime())
             .type(Trigger.class.getName())
             .token(Property.ofValue("test-token"))
+            .teamId(Property.ofValue("team-123"))
             .interval(Duration.ofMinutes(5))
             .baseUrl(baseUrl)
             .build();
@@ -487,6 +488,7 @@ class BoardsTest {
             .id("test-trigger-" + System.nanoTime())
             .type(Trigger.class.getName())
             .token(Property.ofValue("test-token"))
+            .teamId(Property.ofValue("team-123"))
             .interval(Duration.ofMinutes(5))
             .baseUrl(baseUrl)
             .build();
@@ -511,6 +513,7 @@ class BoardsTest {
             .id("test-trigger-consecutive-" + System.nanoTime())
             .type(Trigger.class.getName())
             .token(Property.ofValue("test-token"))
+            .teamId(Property.ofValue("team-123"))
             .interval(Duration.ofMinutes(5))
             .baseUrl(baseUrl)
             .build();
@@ -579,6 +582,7 @@ class BoardsTest {
             .id("test-trigger-delayed-" + System.nanoTime())
             .type(Trigger.class.getName())
             .token(Property.ofValue("test-token"))
+            .teamId(Property.ofValue("team-123"))
             .interval(Duration.ofMinutes(5))
             .baseUrl(baseUrl)
             .build();

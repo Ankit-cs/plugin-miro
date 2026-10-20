@@ -18,6 +18,7 @@ import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.util.Map;
 import java.util.Optional;
@@ -508,7 +509,7 @@ class BoardsTest {
 
     @Test
     void trigger_consecutivePolls_detectsNewBoardsOnSecondPoll() throws Exception {
-        var now = ZonedDateTime.now(java.time.ZoneOffset.UTC);
+        var now = ZonedDateTime.now(ZoneOffset.UTC);
         var trigger = Trigger.builder()
             .id("test-trigger-consecutive-" + System.nanoTime())
             .type(Trigger.class.getName())
@@ -577,7 +578,7 @@ class BoardsTest {
 
     @Test
     void trigger_afterDelayedPollOrRestart_resumesFromWatermark() throws Exception {
-        var now = ZonedDateTime.now(java.time.ZoneOffset.UTC);
+        var now = ZonedDateTime.now(ZoneOffset.UTC);
         var trigger = Trigger.builder()
             .id("test-trigger-delayed-" + System.nanoTime())
             .type(Trigger.class.getName())
@@ -642,7 +643,7 @@ class BoardsTest {
 
     @Test
     void trigger_sameTimestamp_tieBreakDeliversBothWithoutDuplicates() throws Exception {
-        var now = ZonedDateTime.now(java.time.ZoneOffset.UTC);
+        var now = ZonedDateTime.now(ZoneOffset.UTC);
         var sharedTimestamp = now.toInstant().toString();
 
         var trigger = Trigger.builder()
@@ -720,7 +721,7 @@ class BoardsTest {
 
     @Test
     void trigger_pagination_fetchesMultiplePagesUntilWatermark() throws Exception {
-        var now = ZonedDateTime.now(java.time.ZoneOffset.UTC);
+        var now = ZonedDateTime.now(ZoneOffset.UTC);
 
         var trigger = Trigger.builder()
             .id("test-trigger-paging-" + System.nanoTime())
@@ -803,7 +804,7 @@ class BoardsTest {
 
     @Test
     void trigger_pageCapExceeded_throwsExceptionAndDoesNotAdvanceWatermark() throws Exception {
-        var now = ZonedDateTime.now(java.time.ZoneOffset.UTC);
+        var now = ZonedDateTime.now(ZoneOffset.UTC);
 
         var trigger = Trigger.builder()
             .id("test-trigger-cap-" + System.nanoTime())
@@ -869,16 +870,17 @@ class BoardsTest {
             .triggerId(trigger.getId())
             .flowId(context.getValue().getFlowId())
             .namespace(context.getValue().getNamespace())
-            .date(ZonedDateTime.now(java.time.ZoneOffset.UTC))
+            .date(ZonedDateTime.now(ZoneOffset.UTC))
             .build();
 
+        assertThat(trigger.isTeamOrProjectSet(), is(false));
         var ex = assertThrows(IllegalArgumentException.class, () -> trigger.evaluate(context.getKey(), triggerContext));
         assertThat(ex.getMessage(), containsString("Either 'teamId' or 'projectId' must be specified"));
     }
 
     @Test
     void trigger_corruptedWatermark_throwsException() throws Exception {
-        var now = ZonedDateTime.now(java.time.ZoneOffset.UTC);
+        var now = ZonedDateTime.now(ZoneOffset.UTC);
 
         var trigger = Trigger.builder()
             .id("test-trigger-corrupt-" + System.nanoTime())

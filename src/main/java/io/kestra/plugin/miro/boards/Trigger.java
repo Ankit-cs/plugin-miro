@@ -20,6 +20,7 @@ import io.kestra.core.storages.kv.KVStore;
 import io.kestra.core.storages.kv.KVValue;
 import io.kestra.core.storages.kv.KVValueAndMetadata;
 import io.swagger.v3.oas.annotations.media.Schema;
+import jakarta.validation.constraints.AssertTrue;
 import jakarta.validation.constraints.NotNull;
 import lombok.Builder;
 import lombok.EqualsAndHashCode;
@@ -104,6 +105,12 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
     )
     @PluginProperty(group = "processing")
     private Property<String> projectId;
+
+    @JsonIgnore
+    @AssertTrue(message = "Set 'teamId' or 'projectId': Miro only sorts boards by creation date within a team or project")
+    public boolean isTeamOrProjectSet() {
+        return teamId != null || projectId != null;
+    }
 
     @Builder.Default
     @Schema(title = "Polling interval", description = "How often to poll the Miro boards list.")

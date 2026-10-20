@@ -1,6 +1,7 @@
 package io.kestra.plugin.miro.boards;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.core.type.TypeReference;
 import io.kestra.core.http.client.configurations.HttpConfiguration;
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
@@ -14,11 +15,12 @@ import io.kestra.core.models.triggers.TriggerContext;
 import io.kestra.core.models.triggers.TriggerOutput;
 import io.kestra.core.models.triggers.TriggerService;
 import io.kestra.core.runners.RunContext;
+import io.kestra.core.serializers.JacksonMapper;
+import io.kestra.core.storages.kv.KVStore;
+import io.kestra.core.storages.kv.KVValue;
+import io.kestra.core.storages.kv.KVValueAndMetadata;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotNull;
-import com.fasterxml.jackson.core.type.TypeReference;
-import io.kestra.core.serializers.JacksonMapper;
-import io.kestra.core.storages.kv.KVValueAndMetadata;
 import lombok.Builder;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
@@ -37,6 +39,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 @SuperBuilder
 @ToString
@@ -47,10 +50,10 @@ import java.util.Optional;
     title = "Trigger a flow when new Miro boards are created",
     description = """
         Polls the Miro boards list and fires an execution when new boards are created.
+        Either `teamId` or `projectId` must be specified to enable chronological sorting of boards by Miro.
         A watermark tracking the latest board creation timestamp and processed board IDs is persisted in the namespace KV store under key `<flowId.length>_<flowId>_<triggerId.length>_<triggerId>_watermark`, ensuring no boards are missed during downtime, restarts, or scheduler delays.
         On the initial poll, boards created within the last configured interval are evaluated and the watermark is seeded.
-        Paging retrieves up to 10 pages per poll (offset pagination). If the 10-page cap is exceeded due to a large backlog, the poll fails to avoid data loss; to unblock and resume polling from the current time, delete the watermark key in the namespace KV store.
-        Note: Miro only sorts by creation date when `teamId` or `projectId` is specified; when neither is provided, all pages (up to 10) are inspected."""
+        Paging retrieves up to 10 pages per poll (offset pagination). If the 10-page cap is exceeded due to a large backlog, the poll fails to avoid data loss; to unblock and resume polling from the current time, delete the watermark key in the namespace KV store."""
 )
 @Plugin(
     examples = {
@@ -78,6 +81,8 @@ import java.util.Optional;
 )
 public class Trigger extends AbstractTrigger implements PollingTriggerInterface, TriggerOutput<Trigger.Output> {
 
+    private static final int MAX_PAGES = 10;
+
     @Schema(
         title = "Miro OAuth 2.0 access token",
         description = "Use `{{ secret('MIRO_TOKEN') }}` to keep the token out of flow definitions."
@@ -88,14 +93,14 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
 
     @Schema(
         title = "Team ID",
-        description = "Restrict the watch to boards in this team."
+        description = "Restrict the watch to boards in this team. At least one of `teamId` or `projectId` must be specified."
     )
     @PluginProperty(group = "processing")
     private Property<String> teamId;
 
     @Schema(
         title = "Project ID",
-        description = "Restrict the watch to boards in this project."
+        description = "Restrict the watch to boards in this project. At least one of `teamId` or `projectId` must be specified."
     )
     @PluginProperty(group = "processing")
     private Property<String> projectId;
@@ -112,7 +117,7 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
     @Builder.Default
     @Schema(
         title = "Page size",
-        description = "Number of boards to fetch per poll (1-50). Keep low if the team creates boards frequently."
+        description = "Number of boards to fetch per page (1-50). Default is 20."
     )
     @PluginProperty(group = "advanced")
     private Property<Integer> limit = Property.ofValue(20);
@@ -127,10 +132,20 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
         var runContext = conditionContext.getRunContext();
         var logger = runContext.logger();
 
+        var rTeamId = runContext.render(teamId).as(String.class).orElse(null);
+        var rProjectId = runContext.render(projectId).as(String.class).orElse(null);
+        if ((rTeamId == null || rTeamId.isBlank()) && (rProjectId == null || rProjectId.isBlank())) {
+            throw new IllegalArgumentException("Either 'teamId' or 'projectId' must be specified for the Miro board trigger.");
+        }
+
         var rLimit = runContext.render(limit).as(Integer.class).orElse(20);
         if (rLimit < 1 || rLimit > 50) {
             throw new IllegalArgumentException("limit must be between 1 and 50, got: " + rLimit);
         }
+
+        var nowUtc = context.getDate() != null
+            ? context.getDate().withZoneSameInstant(ZoneOffset.UTC)
+            : ZonedDateTime.now(ZoneOffset.UTC);
 
         var flowId = context.getFlowId() != null ? context.getFlowId() : "default";
         var triggerId = context.getTriggerId() != null ? context.getTriggerId() : (this.getId() != null ? this.getId() : "default");
@@ -139,40 +154,88 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
         var namespace = context.getNamespace() != null ? context.getNamespace() : "default";
         var kvStore = runContext.namespaceKv(namespace);
 
-        Optional<io.kestra.core.storages.kv.KVValue> stateEntry;
+        var watermark = readWatermark(kvStore, stateKey);
+        var sinceInstant = watermark != null ? watermark.lastCreatedAt() : nowUtc.minus(interval).toInstant();
+        var seenIds = watermark != null ? watermark.seenIds() : Set.<String>of();
+
+        var newBoards = fetchNewBoards(runContext, rLimit, sinceInstant, seenIds, stateKey);
+
+        var newestCreatedAt = sinceInstant;
+        var newestIds = new LinkedHashSet<String>(seenIds);
+
+        if (!newBoards.isEmpty()) {
+            for (var b : newBoards) {
+                var cStr = b.get("createdAt");
+                var bId = String.valueOf(b.getOrDefault("id", ""));
+                if (cStr != null && !bId.isBlank()) {
+                    try {
+                        var bInstant = Instant.parse(cStr.toString());
+                        if (bInstant.isAfter(newestCreatedAt)) {
+                            newestCreatedAt = bInstant;
+                            newestIds.clear();
+                            newestIds.add(bId);
+                        } else if (bInstant.equals(newestCreatedAt)) {
+                            newestIds.add(bId);
+                        }
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
+        } else if (watermark == null) {
+            newestCreatedAt = nowUtc.toInstant();
+            newestIds.clear();
+        }
+
+        writeWatermark(kvStore, stateKey, newestCreatedAt, newestIds);
+
+        if (newBoards.isEmpty()) {
+            logger.debug("No new Miro boards found after watermark {}", sinceInstant);
+            return Optional.empty();
+        }
+
+        logger.info("Found {} new Miro board(s) since watermark {}", newBoards.size(), sinceInstant);
+
+        var first = newBoards.getFirst();
+        var output = Output.builder()
+            .id(first.getOrDefault("id", "").toString())
+            .name(first.getOrDefault("name", "").toString())
+            .createdAt(first.getOrDefault("createdAt", "").toString())
+            .boards(newBoards)
+            .count(newBoards.size())
+            .build();
+
+        return Optional.of(TriggerService.generateExecution(this, conditionContext, context, output));
+    }
+
+    private Watermark readWatermark(KVStore kvStore, String stateKey) {
+        Optional<KVValue> stateEntry;
         try {
             stateEntry = kvStore.getValue(stateKey);
         } catch (Exception e) {
             throw new IllegalStateException("Failed to read watermark state from namespace KV store for key: " + stateKey, e);
         }
 
-        Map<String, Object> watermark = null;
-        if (stateEntry.isPresent() && stateEntry.get().value() != null) {
-            try {
-                var val = stateEntry.get().value();
-                if (val instanceof Map<?, ?> map) {
-                    watermark = new HashMap<>();
-                    for (var entry : map.entrySet()) {
-                        watermark.put(String.valueOf(entry.getKey()), entry.getValue());
-                    }
-                } else {
-                    watermark = JacksonMapper.ofJson().readValue(val.toString(), new TypeReference<Map<String, Object>>() {});
-                }
-                if (watermark == null || !watermark.containsKey("lastCreatedAt")) {
-                    throw new IllegalStateException("Corrupted watermark: missing 'lastCreatedAt'");
-                }
-                Instant.parse(watermark.get("lastCreatedAt").toString());
-            } catch (Exception e) {
-                throw new IllegalStateException("Failed to deserialize or validate watermark state from namespace KV store for key: " + stateKey, e);
-            }
+        if (stateEntry.isEmpty() || stateEntry.get().value() == null) {
+            return null;
         }
 
-        Instant sinceInstant;
-        var seenIds = new HashSet<String>();
-
-        if (watermark != null) {
-            sinceInstant = Instant.parse(watermark.get("lastCreatedAt").toString());
-            var seenObj = watermark.get("seenIds");
+        try {
+            Map<String, Object> watermarkMap;
+            var val = stateEntry.get().value();
+            if (val instanceof Map<?, ?> map) {
+                watermarkMap = new HashMap<>();
+                for (var entry : map.entrySet()) {
+                    watermarkMap.put(String.valueOf(entry.getKey()), entry.getValue());
+                }
+            } else {
+                watermarkMap = JacksonMapper.ofJson().readValue(val.toString(), new TypeReference<Map<String, Object>>() {});
+            }
+            if (watermarkMap == null || !watermarkMap.containsKey("lastCreatedAt")) {
+                throw new IllegalStateException("Corrupted watermark: missing 'lastCreatedAt'");
+            }
+            var lastCreatedAt = Instant.parse(watermarkMap.get("lastCreatedAt").toString());
+            var seenIds = new HashSet<String>();
+            var seenObj = watermarkMap.get("seenIds");
             if (seenObj instanceof List<?> list) {
                 for (var item : list) {
                     if (item != null) {
@@ -180,25 +243,27 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
                     }
                 }
             }
-        } else {
-            var nowUtc = context.getDate() != null
-                ? context.getDate().withZoneSameInstant(ZoneOffset.UTC)
-                : ZonedDateTime.now(ZoneOffset.UTC);
-            sinceInstant = nowUtc.minus(interval).toInstant();
+            return new Watermark(lastCreatedAt, seenIds);
+        } catch (Exception e) {
+            throw new IllegalStateException("Failed to deserialize or validate watermark state from namespace KV store for key: " + stateKey, e);
         }
+    }
 
-        var rTeamId = runContext.render(teamId).as(String.class).orElse(null);
-        var rProjectId = runContext.render(projectId).as(String.class).orElse(null);
-        var isSorted = (rTeamId != null && !rTeamId.isBlank()) || (rProjectId != null && !rProjectId.isBlank());
-
+    private List<Map<String, Object>> fetchNewBoards(
+        RunContext runContext,
+        int rLimit,
+        Instant sinceInstant,
+        Set<String> seenIds,
+        String stateKey
+    ) throws Exception {
+        var logger = runContext.logger();
         var newBoards = new ArrayList<Map<String, Object>>();
         var collectedBoardIds = new HashSet<String>();
         var currentOffset = 0;
-        var maxPages = 10;
         var hasMore = true;
         var hitPageCap = false;
 
-        for (var page = 0; page < maxPages && hasMore; page++) {
+        for (var page = 0; page < MAX_PAGES && hasMore; page++) {
             var listOutput = io.kestra.plugin.miro.boards.List.builder()
                 .id(this.id)
                 .type(io.kestra.plugin.miro.boards.List.class.getName())
@@ -233,7 +298,7 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
                             if (collectedBoardIds.add(boardId)) {
                                 newBoards.add(board);
                             }
-                        } else if (isSorted) {
+                        } else {
                             reachedOlder = true;
                         }
                     } catch (Exception ignored) {
@@ -242,53 +307,28 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
             }
 
             var total = listOutput.getTotal();
-            if ((isSorted && reachedOlder) || boards.size() < rLimit || (total != null && currentOffset + boards.size() >= total)) {
+            if (reachedOlder || boards.size() < rLimit || (total != null && currentOffset + boards.size() >= total)) {
                 hasMore = false;
             } else {
                 currentOffset += rLimit;
-                if (page == maxPages - 1) {
+                if (page == MAX_PAGES - 1) {
                     hitPageCap = true;
                 }
             }
         }
 
         if (hitPageCap) {
-            logger.warn("Reached maximum page limit ({}) during Miro board polling; some boards may remain unread", maxPages);
-            throw new IllegalStateException("Exceeded maximum page limit (" + maxPages + ") during Miro board polling. "
+            logger.warn("Reached maximum page limit ({}) during Miro board polling; some boards may remain unread", MAX_PAGES);
+            throw new IllegalStateException("Exceeded maximum page limit (" + MAX_PAGES + ") during Miro board polling. "
                 + "To unblock and resume polling from the current time, delete the KV watermark key '" + stateKey + "' in the namespace KV store.");
         }
 
-        var newestCreatedAt = sinceInstant;
-        var newestIds = new LinkedHashSet<String>(seenIds);
+        return newBoards;
+    }
 
-        if (!newBoards.isEmpty()) {
-            for (var b : newBoards) {
-                var cStr = b.get("createdAt");
-                var bId = String.valueOf(b.getOrDefault("id", ""));
-                if (cStr != null && !bId.isBlank()) {
-                    try {
-                        var bInstant = Instant.parse(cStr.toString());
-                        if (bInstant.isAfter(newestCreatedAt)) {
-                            newestCreatedAt = bInstant;
-                            newestIds.clear();
-                            newestIds.add(bId);
-                        } else if (bInstant.equals(newestCreatedAt)) {
-                            newestIds.add(bId);
-                        }
-                    } catch (Exception ignored) {
-                    }
-                }
-            }
-        } else if (watermark == null) {
-            var nowUtc = context.getDate() != null
-                ? context.getDate().withZoneSameInstant(ZoneOffset.UTC)
-                : ZonedDateTime.now(ZoneOffset.UTC);
-            newestCreatedAt = nowUtc.toInstant();
-            newestIds.clear();
-        }
-
+    private void writeWatermark(KVStore kvStore, String stateKey, Instant newestCreatedAt, Set<String> newestIds) {
         try {
-            Map<String, Object> newWatermark = Map.of(
+            var newWatermark = Map.<String, Object>of(
                 "lastCreatedAt", newestCreatedAt.toString(),
                 "seenIds", new ArrayList<>(newestIds)
             );
@@ -299,25 +339,9 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
         } catch (Exception e) {
             throw new IllegalStateException("Failed to persist watermark state in namespace KV store for key: " + stateKey, e);
         }
-
-        if (newBoards.isEmpty()) {
-            logger.debug("No new Miro boards found after watermark {}", sinceInstant);
-            return Optional.empty();
-        }
-
-        logger.info("Found {} new Miro board(s) since watermark {}", newBoards.size(), sinceInstant);
-
-        var first = newBoards.getFirst();
-        var output = Output.builder()
-            .id(first.getOrDefault("id", "").toString())
-            .name(first.getOrDefault("name", "").toString())
-            .createdAt(first.getOrDefault("createdAt", "").toString())
-            .boards(newBoards)
-            .count(newBoards.size())
-            .build();
-
-        return Optional.of(TriggerService.generateExecution(this, conditionContext, context, output));
     }
+
+    private record Watermark(Instant lastCreatedAt, Set<String> seenIds) {}
 
     @Builder
     @Getter

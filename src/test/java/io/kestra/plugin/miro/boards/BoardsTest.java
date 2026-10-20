@@ -851,6 +851,28 @@ class BoardsTest {
     }
 
     @Test
+    void trigger_withoutTeamOrProjectId_throwsIllegalArgumentException() throws Exception {
+        var trigger = Trigger.builder()
+            .id("test-trigger-no-team-" + System.nanoTime())
+            .type(Trigger.class.getName())
+            .token(Property.ofValue("test-token"))
+            .interval(Duration.ofMinutes(5))
+            .baseUrl(baseUrl)
+            .build();
+
+        var context = TestsUtils.mockTrigger(runContextFactory, trigger);
+        var triggerContext = io.kestra.core.models.triggers.Trigger.builder()
+            .triggerId(trigger.getId())
+            .flowId(context.getValue().getFlowId())
+            .namespace(context.getValue().getNamespace())
+            .date(ZonedDateTime.now(java.time.ZoneOffset.UTC))
+            .build();
+
+        var ex = assertThrows(IllegalArgumentException.class, () -> trigger.evaluate(context.getKey(), triggerContext));
+        assertThat(ex.getMessage(), containsString("Either 'teamId' or 'projectId' must be specified"));
+    }
+
+    @Test
     void trigger_corruptedWatermark_throwsException() throws Exception {
         var now = ZonedDateTime.now(java.time.ZoneOffset.UTC);
 
@@ -883,63 +905,6 @@ class BoardsTest {
 
         var ex = assertThrows(IllegalStateException.class, () -> trigger.evaluate(context.getKey(), triggerContext));
         assertThat(ex.getMessage(), containsString("Failed to deserialize or validate watermark"));
-    }
-
-    @Test
-    void trigger_withoutTeamOrProjectId_scansAllPagesAndDeliversNewBoardOnLastPage() throws Exception {
-        var now = ZonedDateTime.now(java.time.ZoneOffset.UTC);
-
-        var trigger = Trigger.builder()
-            .id("test-trigger-no-team-" + System.nanoTime())
-            .type(Trigger.class.getName())
-            .token(Property.ofValue("test-token"))
-            .interval(Duration.ofMinutes(5))
-            .limit(Property.ofValue(2))
-            .baseUrl(baseUrl)
-            .build();
-
-        var context = TestsUtils.mockTrigger(runContextFactory, trigger);
-        var triggerContext = io.kestra.core.models.triggers.Trigger.builder()
-            .triggerId(trigger.getId())
-            .flowId(context.getValue().getFlowId())
-            .namespace(context.getValue().getNamespace())
-            .date(now)
-            .build();
-
-        // Without teamId, results are not sorted by creation date.
-        // Page 1 (offset 0) has old boards (older than interval):
-        wireMock.stubFor(get(urlPathEqualTo("/boards"))
-            .withQueryParam("offset", equalTo("0"))
-            .willReturn(aResponse()
-                .withHeader("Content-Type", "application/json")
-                .withBody(MAPPER.writeValueAsString(Map.of(
-                    "data", java.util.List.of(
-                        boardJsonWithCreatedAt("old-1", "Old 1", now.minus(Duration.ofHours(2)).toInstant().toString()),
-                        boardJsonWithCreatedAt("old-2", "Old 2", now.minus(Duration.ofHours(1)).toInstant().toString())
-                    ),
-                    "total", 3,
-                    "size", 2
-                )))
-                .withStatus(200)));
-
-        // Page 2 (offset 2) has a brand new board created within the interval:
-        wireMock.stubFor(get(urlPathEqualTo("/boards"))
-            .withQueryParam("offset", equalTo("2"))
-            .willReturn(aResponse()
-                .withHeader("Content-Type", "application/json")
-                .withBody(MAPPER.writeValueAsString(Map.of(
-                    "data", java.util.List.of(
-                        boardJsonWithCreatedAt("new-1", "New 1", now.minus(Duration.ofMinutes(1)).toInstant().toString())
-                    ),
-                    "total", 3,
-                    "size", 1
-                )))
-                .withStatus(200)));
-
-        var res = trigger.evaluate(context.getKey(), triggerContext);
-        assertThat(res.isPresent(), is(true));
-        assertThat(res.get().getTrigger().getVariables().get("id"), Matchers.equalTo("new-1"));
-        assertThat(res.get().getTrigger().getVariables().get("count"), Matchers.equalTo(1));
     }
 
     // --- Integration tests (require a real Miro token) ---

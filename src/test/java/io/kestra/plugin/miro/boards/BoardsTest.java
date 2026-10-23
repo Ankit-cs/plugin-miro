@@ -11,6 +11,7 @@ import io.kestra.core.serializers.JacksonMapper;
 import io.kestra.core.storages.kv.KVValueAndMetadata;
 import io.kestra.core.utils.TestsUtils;
 import jakarta.inject.Inject;
+import jakarta.validation.ConstraintViolationException;
 import org.hamcrest.Matchers;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -856,7 +857,7 @@ class BoardsTest {
     }
 
     @Test
-    void trigger_withoutTeamOrProjectId_throwsIllegalArgumentException() throws Exception {
+    void trigger_withoutTeamOrProjectId_throwsConstraintViolationException() throws Exception {
         var trigger = Trigger.builder()
             .id("test-trigger-no-team-" + System.nanoTime())
             .type(Trigger.class.getName())
@@ -874,6 +875,30 @@ class BoardsTest {
             .build();
 
         assertThat(trigger.isTeamOrProjectSet(), is(false));
+        var ex = assertThrows(ConstraintViolationException.class, () -> trigger.evaluate(context.getKey(), triggerContext));
+        assertThat(ex.getMessage(), containsString("Set 'teamId' or 'projectId'"));
+    }
+
+    @Test
+    void trigger_withBlankTeamIdAndNoProjectId_throwsIllegalArgumentException() throws Exception {
+        var trigger = Trigger.builder()
+            .id("test-trigger-blank-team-" + System.nanoTime())
+            .type(Trigger.class.getName())
+            .token(Property.ofValue("test-token"))
+            .teamId(Property.ofValue(""))
+            .interval(Duration.ofMinutes(5))
+            .baseUrl(baseUrl)
+            .build();
+
+        var context = TestsUtils.mockTrigger(runContextFactory, trigger);
+        var triggerContext = io.kestra.core.models.triggers.Trigger.builder()
+            .triggerId(trigger.getId())
+            .flowId(context.getValue().getFlowId())
+            .namespace(context.getValue().getNamespace())
+            .date(ZonedDateTime.now(ZoneOffset.UTC))
+            .build();
+
+        assertThat(trigger.isTeamOrProjectSet(), is(true));
         var ex = assertThrows(IllegalArgumentException.class, () -> trigger.evaluate(context.getKey(), triggerContext));
         assertThat(ex.getMessage(), containsString("Either 'teamId' or 'projectId' must be specified"));
     }
